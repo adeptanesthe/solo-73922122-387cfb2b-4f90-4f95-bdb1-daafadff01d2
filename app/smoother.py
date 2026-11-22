@@ -138,6 +138,8 @@ class LanguageSmoother:
         switch_frames: int,
         posterior_threshold: float,
         switch_penalty: float = 2.0,
+        transition_matrix: Optional[np.ndarray] = None,
+        matrix_source: str = "penalty",
     ) -> None:
         self.session_id = session_id
         self.languages: List[str] = list(languages)
@@ -146,13 +148,35 @@ class LanguageSmoother:
         self.switch_frames = switch_frames
         self.posterior_threshold = posterior_threshold
         self.switch_penalty = float(switch_penalty)
+        self.matrix_source = matrix_source
 
-        # HMM 对数转移矩阵：保持 0 代价，切换到其它状态 -penalty，再行归一化。
-        log_a = np.zeros((self.n, self.n), dtype=np.float64)
-        off = ~np.eye(self.n, dtype=bool)
-        log_a[off] = -self.switch_penalty
-        log_a -= _logsumexp(log_a)[:, None]
-        self._log_a = log_a
+        # HMM 对数转移矩阵。默认沿用切换惩罚构造；也可注入同语种组校准后
+        # 启用的矩阵（调用方负责按本会话语种顺序重排）。会话创建后矩阵固定，
+        # 校准期间新启用的矩阵不影响已开会话。
+        if transition_matrix is None:
+            log_a = np.zeros((self.n, self.n), dtype=np.float64)
+            off = ~np.eye(self.n, dtype=bool)
+            log_a[off] = -self.switch_penalty
+            log_a -= _logsumexp(log_a)[:, None]
+            self._log_a = log_a
+        else:
+            a = np.asarray(transition_matrix, dtype=np.float64)
+            if a.shape != (self.n, self.n):
+                raise SessionError(
+                    422,
+                    "dimension_mismatch",
+                    f"transition matrix must be {self.n}x{self.n}, got {a.shape}",
+                )
+            if not np.all(np.isfinite(a)) or np.any(a <= 0.0):
+                raise SessionError(
+                    422, "invalid_matrix", "transition matrix entries must be finite and > 0"
+                )
+            row_sums = a.sum(axis=1)
+            if np.any(np.abs(row_sums - 1.0) > 1e-9):
+                raise SessionError(
+                    422, "invalid_matrix", "each transition matrix row must sum to 1"
+                )
+            self._log_a = np.log(a / row_sums[:, None])
 
         # 前向滤波状态（对数域，初始均匀先验）。
         self._log_alpha = np.zeros(self.n, dtype=np.float64)
@@ -179,6 +203,11 @@ class LanguageSmoother:
     def next_seq(self) -> int:
         return self._frames_committed
 
+    @property
+    def transition_matrix(self) -> np.ndarray:
+        """当前生效的概率域转移矩阵（语种顺序同 ``self.languages``）。"""
+        return np.exp(self._log_a)
+
     def final_segments(self) -> List[Segment]:
         if self._sealed:
             return list(self._final_segments or [])
@@ -193,6 +222,8 @@ class LanguageSmoother:
             "switch_frames": self.switch_frames,
             "posterior_threshold": self.posterior_threshold,
             "switch_penalty": self.switch_penalty,
+            "matrix_source": self.matrix_source,
+            "transition_matrix": np.exp(self._log_a).tolist(),
             "next_seq": self._frames_committed,
             "current_language": self._current_language(),
             "pending_language": self._pending_language,
